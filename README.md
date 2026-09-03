@@ -1,6 +1,6 @@
 # Infinite Context for Hermes Agent
 
-Version 0.9.0
+Version 0.9.1
 
 Infinite Context is a Hermes Agent `ContextEngine` plugin for long-running conversations and durable memory. It keeps the authoritative Hermes transcript intact while selecting a bounded provider prompt from recent conversation, retrieved historical context, and scoped durable memories.
 
@@ -149,6 +149,13 @@ Hermes' persisted conversation transcript remains authoritative; Infinite Contex
 - Project binding currently has limited UI visibility because Hermes' current web dashboard does not expose first-class project controls. A future UI can present project assignment as metadata without placing control instructions in the model-visible prompt.
 - Deleting a Hermes session does not automatically delete every consolidated Infinite memory derived from it. `/infinite cleanup` removes orphaned indexed session data, while durable-memory lifecycle remains conservative.
 - Importance/retirement thresholds are intentionally conservative and may need tuning with long-term real-world use.
+
+
+## Version History
+
+**0.9.1** Added some memory guardrails to prevent OOM crashes in edge-case scenarios
+
+**0.9.0** Initial release
 
 
 ## AI & Safety Disclaimer

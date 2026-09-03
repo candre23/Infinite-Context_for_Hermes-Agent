@@ -66,7 +66,7 @@ cp "${SCRIPT_DIR}/infinite_v0/plugin.yaml" "${ENGINE_DIR}/plugin.yaml"
 rm -f "${HOME}/.hermes/context_engine/infinite_v0_trace.log"
 
 echo
-echo "Installed Infinite Context v0.9.1 to: ${ENGINE_DIR}"
+echo "Installed Infinite Context v0.9.2 to: ${ENGINE_DIR}"
 echo "Existing SQLite data, memories, project bindings, and embeddings were preserved."
 echo "Ensure Hermes config selects context.engine: infinite_v0, then restart Hermes."
 echo "After restart, run /infinite status."

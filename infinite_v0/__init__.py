@@ -203,7 +203,7 @@ def _write_operation_status(
     try:
         snap = dict(resource or _resource_snapshot())
         payload = {
-            "version": "0.9.1",
+            "version": "0.9.2",
             "updated_at": time.time(),
             "operation": operation,
             "state": state,
@@ -2134,11 +2134,18 @@ class InfiniteContextV0(ContextEngine):
         self.store.chunk_chars = self.chunk_chars
         self.store.chunk_overlap_chars = self.chunk_overlap_chars
 
-        # Infinite Memory v0.9.1: background curation, scoped retrieval, project namespaces, plus salience/forgetting. Normal turns
-        # never wait for memory housekeeping. New user activity cancels an
-        # in-flight background curation request and resets the idle timer.
+        # Infinite Memory v0.9.2: background curation, scoped retrieval, project namespaces,
+        # salience/forgetting, and Cockpit-aware user-idle detection. Normal turns never
+        # wait for memory housekeeping. When Cockpit publishes frontend activity,
+        # composer activity is authoritative and allows a shorter idle delay. Without
+        # Cockpit, retain the conservative Hermes-only fallback delay.
         self.memory_enabled = os.getenv("HERMES_INFINITE_MEMORY_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
         self.memory_idle_seconds = max(15, int(os.getenv("HERMES_INFINITE_MEMORY_IDLE_SECONDS", "180")))
+        self.cockpit_idle_seconds = max(15, int(os.getenv("HERMES_INFINITE_COCKPIT_IDLE_SECONDS", "60")))
+        self.cockpit_activity_file = Path(os.getenv(
+            "HERMES_INFINITE_COCKPIT_ACTIVITY_FILE",
+            str(Path.home() / ".hermes" / "context_engine" / "cockpit_activity.json"),
+        )).expanduser()
         self.memory_batch_turns = max(1, min(24, int(os.getenv("HERMES_INFINITE_MEMORY_BATCH_TURNS", "8"))))
         self.memory_max_input_chars = max(4000, int(os.getenv("HERMES_INFINITE_MEMORY_MAX_INPUT_CHARS", "18000")))
         self.memory_max_output_tokens = max(128, min(2048, int(os.getenv("HERMES_INFINITE_MEMORY_MAX_OUTPUT_TOKENS", "700"))))
@@ -2232,6 +2239,42 @@ class InfiniteContextV0(ContextEngine):
         self._last_activity = time.monotonic()
         self._memory_cancel.set()
         self._memory_wakeup.set()
+
+    def _cockpit_activity_age(self) -> Optional[float]:
+        """Return seconds since Cockpit frontend activity, or None if unavailable.
+
+        Cockpit updates a tiny heartbeat file when the user is active in the browser.
+        File mtime is intentionally the compatibility contract here: Infinite does not
+        depend on Cockpit's internal JSON field names, so the two projects can evolve
+        independently as long as activity continues to refresh the file atomically.
+        """
+        try:
+            path = self.cockpit_activity_file
+            if not path.is_file():
+                return None
+            return max(0.0, time.time() - path.stat().st_mtime)
+        except Exception:
+            return None
+
+    def _background_idle_state(self) -> Tuple[bool, float, int, str]:
+        """Return (ready, idle_seconds, required_seconds, source).
+
+        If Cockpit is present, browser/composer activity controls the 60-second quiet
+        period while Hermes request activity is still honored. If Cockpit is absent,
+        fall back to the legacy 180-second Hermes-only idle timer.
+        """
+        hermes_idle = max(0.0, time.monotonic() - self._last_activity)
+        cockpit_age = self._cockpit_activity_age()
+        if cockpit_age is None:
+            required = self.memory_idle_seconds
+            return hermes_idle >= required, hermes_idle, required, "hermes"
+        idle_for = min(hermes_idle, cockpit_age)
+        required = self.cockpit_idle_seconds
+        return idle_for >= required, idle_for, required, "cockpit"
+
+    def _cockpit_user_active(self) -> bool:
+        age = self._cockpit_activity_age()
+        return age is not None and age < self.cockpit_idle_seconds
 
     def _memory_job_snapshot(self) -> Dict[str, Any]:
         with self._memory_job_lock:
@@ -2449,7 +2492,7 @@ class InfiniteContextV0(ContextEngine):
         try:
             with urllib.request.urlopen(req, timeout=180) as resp:
                 for raw_line in resp:
-                    if self._memory_cancel.is_set() or self._memory_stop.is_set():
+                    if self._memory_cancel.is_set() or self._memory_stop.is_set() or self._cockpit_user_active():
                         try: resp.close()
                         except Exception: pass
                         return {"ok": False, "cancelled": True, "error": "cancelled by user activity"}
@@ -2562,10 +2605,17 @@ class InfiniteContextV0(ContextEngine):
                 continue
             if self._turn_inflight:
                 continue
-            idle_for = time.monotonic() - self._last_activity
-            if idle_for < self.memory_idle_seconds:
-                # Sleep in short increments so new activity can reset the timer.
-                self._memory_wakeup.wait(timeout=min(5.0, self.memory_idle_seconds - idle_for))
+            ready, idle_for, required_idle, activity_source = self._background_idle_state()
+            if not ready:
+                # Cockpit activity is preferred when available because it sees the user
+                # typing before Hermes receives a submitted message. Without Cockpit,
+                # this remains the legacy Hermes-request idle timer.
+                self._set_memory_job(
+                    state="waiting_user_idle",
+                    session_id=self.session_id,
+                    error="",
+                )
+                self._memory_wakeup.wait(timeout=min(5.0, max(0.25, required_idle - idle_for)))
                 self._memory_wakeup.set()
                 continue
             sid = self.session_id
@@ -2685,11 +2735,14 @@ class InfiniteContextV0(ContextEngine):
         turns = self.store.session_turn_count(sid) if sid else 0
         pending = max(0, turns - last)
         job = self._memory_job_snapshot()
-        idle_for = max(0, int(time.monotonic() - self._last_activity))
+        ready, idle_for_value, idle_required, activity_source = self._background_idle_state()
+        idle_for = max(0, int(idle_for_value))
+        cockpit_age = self._cockpit_activity_age()
         return "\n".join([
-            "Infinite Memory v0.9.0",
+            "Infinite Memory v0.9.2",
             f"  Enabled: {self.memory_enabled}",
-            f"  Idle delay: {self.memory_idle_seconds}s",
+            f"  Idle policy: {idle_required}s via {activity_source}",
+            f"  Cockpit heartbeat: {'present' if cockpit_age is not None else 'not found'}" + (f"; last activity {int(cockpit_age)}s ago" if cockpit_age is not None else ""),
             f"  Current session: {sid or '(none)'}",
             f"  Processed through turn: {last}",
             f"  Pending completed turns: {pending}",
@@ -2834,7 +2887,7 @@ class InfiniteContextV0(ContextEngine):
         if not request_messages:
             return None
 
-        # v0.9.1: slash commands cannot safely identify their originating chat.
+        # v0.9.x: slash commands cannot safely identify their originating chat.
         # Consume queued project changes only here, on a real provider request,
         # where self.session_id has been resolved for this request. This happens
         # before durable-memory retrieval so same-request project recall works.
@@ -2862,7 +2915,7 @@ class InfiniteContextV0(ContextEngine):
         if not query:
             query = _text_content(turns[-1][0].get("content"))
 
-        # v0.9.1: a new, unbound chat may explicitly refer to work from another
+        # v0.9.x: a new, unbound chat may explicitly refer to work from another
         # chat. Resolve that against known project metadata before memory retrieval.
         # The inference is deliberately conservative: continuity language plus
         # project-label evidence is required, and semantic similarity alone can
@@ -3277,7 +3330,7 @@ class InfiniteContextV0(ContextEngine):
 
         sel = persisted_sel or self.last_selection or {}
         lines = [
-            "Infinite Context v0.9.1",
+            "Infinite Context v0.9.2",
             f"  Active engine: {'YES' if (_ACTIVE_ENGINE is self and self._configured_engine_name() == 'infinite_v0') else 'NO/UNKNOWN'}",
             f"  Configured engine: {self._configured_engine_name() or '(unknown)'}",
             f"  Session: {status_session or '(none)'}",
@@ -3319,7 +3372,7 @@ class InfiniteContextV0(ContextEngine):
         lines.extend([
             f"  Infinite Memory: {'enabled' if self.memory_enabled else 'disabled'}; "
             f"{memstats.get('active',0)} active, {memstats.get('retired',0)} retired, {memstats.get('revisions',0)} revisions",
-            f"  Memory housekeeping: state={memjob.get('state','idle')} idle_delay={self.memory_idle_seconds}s "
+            f"  Memory housekeeping: state={memjob.get('state','idle')} idle_delay={self._background_idle_state()[2]}s "
             f"processed_through={mem_last} pending_turns={mem_pending}",
             "",
             "Budgets:",

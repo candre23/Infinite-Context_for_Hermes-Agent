@@ -1,6 +1,6 @@
 # Infinite Context for Hermes Agent
 
-Version 0.9.1
+Version 0.9.2
 
 Infinite Context is a Hermes Agent `ContextEngine` plugin for long-running conversations and durable memory. It keeps the authoritative Hermes transcript intact while selecting a bounded provider prompt from recent conversation, retrieved historical context, and scoped durable memories.
 
@@ -156,6 +156,8 @@ Hermes' persisted conversation transcript remains authoritative; Infinite Contex
 
 
 ## Version History
+
+**0.9.2**  Added better idle monitoring (user typing registers as activity) when hermes cockpit is present
 
 **0.9.1** Added some memory guardrails to prevent OOM crashes in edge-case scenarios
 

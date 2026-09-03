@@ -25,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from agent.context_engine import ContextEngine
 
@@ -149,6 +149,81 @@ def _query_anchor_tokens(tokens: Sequence[str]) -> List[str]:
     return anchors
 
 
+def _iter_segmented_turns(messages: Iterable[Dict[str, Any]]) -> Iterator[List[Dict[str, Any]]]:
+    """Yield user-anchored turns without materializing the complete transcript."""
+    current: Optional[List[Dict[str, Any]]] = None
+    for msg in messages:
+        role = msg.get("role")
+        if role == "user":
+            if current:
+                yield current
+            current = [msg]
+        elif current is not None:
+            current.append(msg)
+    if current:
+        yield current
+
+
+def _resource_snapshot() -> Dict[str, int]:
+    """Return Linux MemAvailable and this process RSS in bytes, best effort."""
+    mem_available = 0
+    rss = 0
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("MemAvailable:"):
+                mem_available = int(line.split()[1]) * 1024
+                break
+    except Exception:
+        pass
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("VmRSS:"):
+                rss = int(line.split()[1]) * 1024
+                break
+    except Exception:
+        pass
+    return {"mem_available_bytes": mem_available, "rss_bytes": rss}
+
+def _gib(value: int) -> float:
+    return float(value or 0) / float(1024 ** 3)
+
+def _write_operation_status(
+    hermes_home: Path,
+    *,
+    operation: str,
+    state: str,
+    detail: str = "",
+    session_id: str = "",
+    done: int = 0,
+    total: int = 0,
+    batch_size: int = 0,
+    resource: Optional[Dict[str, int]] = None,
+) -> None:
+    """Publish a tiny atomic JSON status file for Cockpit/diagnostics."""
+    try:
+        snap = dict(resource or _resource_snapshot())
+        payload = {
+            "version": "0.9.1",
+            "updated_at": time.time(),
+            "operation": operation,
+            "state": state,
+            "detail": detail,
+            "session_id": session_id,
+            "done": int(done or 0),
+            "total": int(total or 0),
+            "batch_size": int(batch_size or 0),
+            "rss_bytes": int(snap.get("rss_bytes") or 0),
+            "mem_available_bytes": int(snap.get("mem_available_bytes") or 0),
+        }
+        base = Path(hermes_home).expanduser() / "context_engine"
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / "infinite_v0_status.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
 def _segment_turns(messages: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[List[Dict[str, Any]]]]:
     """Return (prefix, user-anchored turns).
 
@@ -246,17 +321,12 @@ def _trim_tool_results_in_turn(
     return out, trimmed_meta
 
 
-def _chunk_text(text: str, *, chunk_chars: int = 6000, overlap_chars: int = 800) -> List[str]:
-    """Split long text into overlapping character chunks."""
+def _iter_text_chunks(text: str, *, chunk_chars: int = 6000, overlap_chars: int = 800) -> Iterator[str]:
+    """Yield overlapping text chunks without materializing all chunks at once."""
     if not text:
-        return []
-    if len(text) <= chunk_chars:
-        return [text]
-
+        return
     chunk_chars = max(1000, int(chunk_chars))
     overlap_chars = max(0, min(int(overlap_chars), chunk_chars // 2))
-
-    out: List[str] = []
     start = 0
     n = len(text)
     while start < n:
@@ -267,16 +337,17 @@ def _chunk_text(text: str, *, chunk_chars: int = 6000, overlap_chars: int = 800)
             nl = text.rfind("\n", floor, target_end)
             if nl > start:
                 end = nl + 1
-
         chunk = text[start:end]
         if chunk:
-            out.append(chunk)
-
+            yield chunk
         if end >= n:
             break
         start = max(start + 1, end - overlap_chars)
 
-    return out
+
+def _chunk_text(text: str, *, chunk_chars: int = 6000, overlap_chars: int = 800) -> List[str]:
+    """Compatibility wrapper for call sites that need a materialized chunk list."""
+    return list(_iter_text_chunks(text, chunk_chars=chunk_chars, overlap_chars=overlap_chars))
 
 
 
@@ -429,6 +500,10 @@ class SQLiteTurnStore:
         self.chunk_overlap_chars = 800
         self.hermes_home = Path.home() / ".hermes"
         self.embedding_backend: Optional[LocalEmbeddingBackend] = None
+        self.index_batch_turns = 4
+        self.embed_batch_chunks = 16
+        self.memory_pause_bytes = 12 * 1024**3
+        self.memory_abort_bytes = 8 * 1024**3
 
     def open(self, hermes_home: Optional[str] = None) -> None:
         if self.conn is not None:
@@ -610,82 +685,227 @@ class SQLiteTurnStore:
                 self.conn.close()
                 self.conn = None
 
-    def upsert_turns(self, session_id: str, turns: Sequence[Sequence[Dict[str, Any]]]) -> Dict[str, int]:
-        """Incrementally sync transcript turns; expand Hermes spill files for indexing."""
-        with self._lock:
-            if self.conn is None:
-                self.open()
-            assert self.conn is not None
-            old_hashes = {int(tn): str(h) for tn, h in self.conn.execute(
-                "SELECT turn_no, turn_hash FROM turns WHERE session_id=?", (session_id,)).fetchall()}
-            changed = []
-            expanded_files = 0
-            expanded_chars = 0
-            for turn_no, turn in enumerate(turns, start=1):
-                payload = json.dumps(list(turn), ensure_ascii=False, separators=(",", ":"), default=str)
-                digest = hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
-                index_turn = []
-                for msg in turn:
-                    clone = dict(msg)
-                    if clone.get("role") == "tool":
-                        full, source_path, expanded = _safe_read_spillover(clone.get("content"), self.hermes_home)
-                        if expanded:
-                            clone["content"] = full
-                            clone["_infinite_source_kind"] = "hermes_spillover"
-                            clone["_infinite_source_path"] = source_path or ""
-                            clone["_infinite_source_chars"] = len(full)
-                            expanded_files += 1
-                            expanded_chars += len(full)
-                    index_turn.append(clone)
-                if old_hashes.get(turn_no) != digest:
-                    changed.append((turn_no, index_turn, digest, _turn_search_text(index_turn), payload))
-            with self.conn:
-                for turn_no, index_turn, digest, search_text, payload in changed:
-                    self.conn.execute("""
-                        INSERT INTO turns(session_id,turn_no,turn_hash,search_text,payload_json)
-                        VALUES (?,?,?,?,?) ON CONFLICT(session_id,turn_no) DO UPDATE SET
-                        turn_hash=excluded.turn_hash,search_text=excluded.search_text,payload_json=excluded.payload_json
-                        """, (session_id, turn_no, digest, search_text, payload))
-                    self.conn.execute("DELETE FROM chunks WHERE session_id=? AND turn_no=?", (session_id, turn_no))
-                    chunk_rows = []
-                    for message_index, msg in enumerate(index_turn):
-                        role = str(msg.get("role", "unknown"))
-                        content = _text_content(msg.get("content")).strip()
-                        tool_calls = msg.get("tool_calls")
-                        if tool_calls:
-                            try: tc_text = json.dumps(tool_calls, ensure_ascii=False, default=str)
-                            except Exception: tc_text = str(tool_calls)
-                            content = (content + "\n" + tc_text).strip()
-                        if not content: continue
-                        source_kind = str(msg.get("_infinite_source_kind") or "transcript")
-                        source_path = str(msg.get("_infinite_source_path") or "")
-                        source_chars = int(msg.get("_infinite_source_chars") or len(content))
-                        chunks = _chunk_text(content, chunk_chars=self.chunk_chars, overlap_chars=self.chunk_overlap_chars)
-                        vectors = []
-                        if self.embedding_backend is not None and self.embedding_backend.available:
-                            vectors = self.embedding_backend.embed(chunks)
-                        for chunk_index, chunk in enumerate(chunks):
-                            chash = hashlib.sha256(_normalize_for_duplicate(chunk).encode("utf-8", "replace")).hexdigest()
-                            vec_blob = _pack_vector(vectors[chunk_index]) if chunk_index < len(vectors) else None
-                            vec_model = self.embedding_backend.model_name if vec_blob is not None and self.embedding_backend else ""
-                            chunk_rows.append((session_id,turn_no,message_index,chunk_index,role,chunk,chash,
-                                               source_kind,source_path,source_chars,vec_blob,vec_model))
-                    if chunk_rows:
-                        self.conn.executemany("""
-                            INSERT INTO chunks(session_id,turn_no,message_index,chunk_index,role,chunk_text,
-                            chunk_hash,source_kind,source_path,source_chars,embedding,embedding_model)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", chunk_rows)
-                self.conn.execute("DELETE FROM turns WHERE session_id=? AND turn_no>?", (session_id, len(turns)))
-                self.conn.execute("DELETE FROM chunks WHERE session_id=? AND turn_no>?", (session_id, len(turns)))
-            missing = self.conn.execute("SELECT turn_no,message_index,chunk_index,chunk_text FROM chunks WHERE session_id=? AND chunk_hash=''", (session_id,)).fetchall()
-            if missing:
+    def _insert_chunk_batch(
+        self, *, session_id: str, turn_no: int, message_index: int, role: str,
+        source_kind: str, source_path: str, source_chars: int, chunks: Sequence[str],
+        first_chunk_index: int, pause_bytes: int, abort_bytes: int, publish: Any,
+    ) -> int:
+        """Embed and insert one bounded chunk batch; caller owns the transaction."""
+        snap_before = _resource_snapshot()
+        avail = int(snap_before.get("mem_available_bytes") or 0)
+        _trace("embedding_batch_resource", phase="before", session_id=session_id,
+               turn_no=turn_no, message_index=message_index, chunks=len(chunks),
+               rss_bytes=snap_before["rss_bytes"], mem_available_bytes=avail)
+        logger.info(
+            "Infinite Context embedding batch start session=%s turn=%d chunks=%d RSS=%.2f GiB MemAvailable=%.2f GiB",
+            session_id, turn_no, len(chunks), _gib(snap_before["rss_bytes"]), _gib(avail),
+        )
+        if avail and avail < abort_bytes:
+            raise MemoryError(f"MemAvailable {_gib(avail):.1f} GiB below abort threshold")
+        if avail and avail < pause_bytes:
+            raise RuntimeError(f"__INFINITE_PAUSE_MEMORY__:{avail}")
+        vectors: List[List[float]] = []
+        if self.embedding_backend is not None and self.embedding_backend.available:
+            publish("running", f"Embedding {len(chunks)} chunks", turn_no - 1, len(chunks), snap_before)
+            vectors = self.embedding_backend.embed(chunks)
+        snap_after = _resource_snapshot()
+        _trace("embedding_batch_resource", phase="after", session_id=session_id,
+               turn_no=turn_no, message_index=message_index, chunks=len(chunks),
+               rss_bytes=snap_after["rss_bytes"], mem_available_bytes=snap_after["mem_available_bytes"])
+        logger.info(
+            "Infinite Context embedding batch end session=%s turn=%d chunks=%d RSS=%.2f GiB MemAvailable=%.2f GiB",
+            session_id, turn_no, len(chunks), _gib(snap_after["rss_bytes"]), _gib(snap_after["mem_available_bytes"]),
+        )
+        if int(snap_after.get("mem_available_bytes") or 0) and int(snap_after["mem_available_bytes"]) < abort_bytes:
+            raise MemoryError(f"MemAvailable {_gib(snap_after['mem_available_bytes']):.1f} GiB below abort threshold after embedding")
+        rows = []
+        for offset, chunk in enumerate(chunks):
+            chunk_index = first_chunk_index + offset
+            chash = hashlib.sha256(_normalize_for_duplicate(chunk).encode("utf-8", "replace")).hexdigest()
+            vec_blob = _pack_vector(vectors[offset]) if offset < len(vectors) else None
+            vec_model = self.embedding_backend.model_name if vec_blob is not None and self.embedding_backend else ""
+            rows.append((session_id, turn_no, message_index, chunk_index, role, chunk, chash,
+                         source_kind, source_path, source_chars, vec_blob, vec_model))
+        if rows:
+            self.conn.executemany(
+                """INSERT INTO chunks(session_id,turn_no,message_index,chunk_index,role,chunk_text,
+                   chunk_hash,source_kind,source_path,source_chars,embedding,embedding_model)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", rows,
+            )
+        return first_chunk_index + len(chunks)
+
+    def upsert_turns(self, session_id: str, turns: Iterable[Sequence[Dict[str, Any]]]) -> Dict[str, Any]:
+        """Incrementally sync transcript turns using a bounded working set.
+
+        No complete changed-turn list is built. Each turn is transformed, chunked,
+        embedded in small batches, and committed independently. Low-memory guards
+        stop before the next batch so a huge chat cannot consume RAM unchecked.
+        """
+        if self.conn is None:
+            self.open()
+        assert self.conn is not None
+        changed_turns = 0
+        expanded_files = 0
+        expanded_chars = 0
+        seen_turns = 0
+        completed = True
+        pause_reason = ""
+        batch_count = 0
+        index_batch_turns = max(1, int(getattr(self, "index_batch_turns", 4)))
+        embed_batch_chunks = max(1, int(getattr(self, "embed_batch_chunks", 16)))
+        pause_bytes = int(getattr(self, "memory_pause_bytes", 12 * 1024**3))
+        abort_bytes = int(getattr(self, "memory_abort_bytes", 8 * 1024**3))
+
+        def publish(state: str, detail: str, done: int = 0, batch_size: int = 0, snap=None) -> None:
+            _write_operation_status(
+                self.hermes_home, operation="indexing", state=state, detail=detail,
+                session_id=session_id, done=done, batch_size=batch_size, resource=snap,
+            )
+
+        publish("running", "Indexing chat", 0, index_batch_turns)
+        for turn_no, turn in enumerate(turns, start=1):
+            seen_turns = turn_no
+            if (turn_no - 1) % index_batch_turns == 0:
+                snap_before = _resource_snapshot()
+                _trace("index_batch_resource", phase="before", session_id=session_id,
+                       turn_no=turn_no, rss_bytes=snap_before["rss_bytes"],
+                       mem_available_bytes=snap_before["mem_available_bytes"])
+                logger.info(
+                    "Infinite Context index batch start session=%s turn=%d RSS=%.2f GiB MemAvailable=%.2f GiB",
+                    session_id, turn_no, _gib(snap_before["rss_bytes"]), _gib(snap_before["mem_available_bytes"]),
+                )
+                avail = int(snap_before.get("mem_available_bytes") or 0)
+                if avail and avail < abort_bytes:
+                    completed = False
+                    pause_reason = "aborted_low_memory"
+                    publish("aborted_low_memory", f"Indexing aborted: MemAvailable {_gib(avail):.1f} GiB", turn_no - 1, index_batch_turns, snap_before)
+                    break
+                if avail and avail < pause_bytes:
+                    completed = False
+                    pause_reason = "paused_low_memory"
+                    publish("paused_low_memory", f"Indexing paused: MemAvailable {_gib(avail):.1f} GiB", turn_no - 1, index_batch_turns, snap_before)
+                    break
+                batch_count += 1
+
+            # Fetch only this turn's old hash instead of building a hash map for
+            # the entire conversation.
+            payload = json.dumps(list(turn), ensure_ascii=False, separators=(",", ":"), default=str)
+            digest = hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+            with self._lock:
+                old = self.conn.execute(
+                    "SELECT turn_hash FROM turns WHERE session_id=? AND turn_no=?",
+                    (session_id, turn_no),
+                ).fetchone()
+            if old and str(old[0]) == digest:
+                continue
+
+            index_turn: List[Dict[str, Any]] = []
+            for msg in turn:
+                clone = dict(msg)
+                if clone.get("role") == "tool":
+                    full, source_path, expanded = _safe_read_spillover(clone.get("content"), self.hermes_home)
+                    if expanded:
+                        clone["content"] = full
+                        clone["_infinite_source_kind"] = "hermes_spillover"
+                        clone["_infinite_source_path"] = source_path or ""
+                        clone["_infinite_source_chars"] = len(full)
+                        expanded_files += 1
+                        expanded_chars += len(full)
+                index_turn.append(clone)
+            search_text = _turn_search_text(index_turn)
+
+            # Build/insert this one turn inside a transaction. If memory becomes
+            # critical during an embedding batch, rollback this turn and retry on
+            # a later sync rather than leaving partial chunk state.
+            try:
+                with self._lock:
+                    with self.conn:
+                        self.conn.execute(
+                            """INSERT INTO turns(session_id,turn_no,turn_hash,search_text,payload_json)
+                               VALUES (?,?,?,?,?) ON CONFLICT(session_id,turn_no) DO UPDATE SET
+                               turn_hash=excluded.turn_hash,search_text=excluded.search_text,payload_json=excluded.payload_json""",
+                            (session_id, turn_no, digest, search_text, payload),
+                        )
+                        self.conn.execute("DELETE FROM chunks WHERE session_id=? AND turn_no=?", (session_id, turn_no))
+                        for message_index, msg in enumerate(index_turn):
+                            role = str(msg.get("role", "unknown"))
+                            content = _text_content(msg.get("content")).strip()
+                            tool_calls = msg.get("tool_calls")
+                            if tool_calls:
+                                try:
+                                    tc_text = json.dumps(tool_calls, ensure_ascii=False, default=str)
+                                except Exception:
+                                    tc_text = str(tool_calls)
+                                content = (content + "\n" + tc_text).strip()
+                            if not content:
+                                continue
+                            source_kind = str(msg.get("_infinite_source_kind") or "transcript")
+                            source_path = str(msg.get("_infinite_source_path") or "")
+                            source_chars = int(msg.get("_infinite_source_chars") or len(content))
+                            chunk_iter = _iter_text_chunks(
+                                content, chunk_chars=self.chunk_chars, overlap_chars=self.chunk_overlap_chars
+                            )
+                            chunk_batch: List[str] = []
+                            next_chunk_index = 0
+                            for chunk in chunk_iter:
+                                chunk_batch.append(chunk)
+                                if len(chunk_batch) < embed_batch_chunks:
+                                    continue
+                                next_chunk_index = self._insert_chunk_batch(
+                                    session_id=session_id, turn_no=turn_no, message_index=message_index,
+                                    role=role, source_kind=source_kind, source_path=source_path,
+                                    source_chars=source_chars, chunks=chunk_batch, first_chunk_index=next_chunk_index,
+                                    pause_bytes=pause_bytes, abort_bytes=abort_bytes, publish=publish,
+                                )
+                                chunk_batch = []
+                            if chunk_batch:
+                                self._insert_chunk_batch(
+                                    session_id=session_id, turn_no=turn_no, message_index=message_index,
+                                    role=role, source_kind=source_kind, source_path=source_path,
+                                    source_chars=source_chars, chunks=chunk_batch, first_chunk_index=next_chunk_index,
+                                    pause_bytes=pause_bytes, abort_bytes=abort_bytes, publish=publish,
+                                )
+                changed_turns += 1
+            except MemoryError as exc:
+                completed = False
+                pause_reason = "aborted_low_memory"
+                snap = _resource_snapshot()
+                publish("aborted_low_memory", str(exc), turn_no - 1, embed_batch_chunks, snap)
+                break
+            except RuntimeError as exc:
+                if str(exc).startswith("__INFINITE_PAUSE_MEMORY__:"):
+                    completed = False
+                    pause_reason = "paused_low_memory"
+                    snap = _resource_snapshot()
+                    publish("paused_low_memory", f"Indexing paused: MemAvailable {_gib(snap['mem_available_bytes']):.1f} GiB", turn_no - 1, embed_batch_chunks, snap)
+                    break
+                raise
+
+            if turn_no % index_batch_turns == 0:
+                snap_after = _resource_snapshot()
+                _trace("index_batch_resource", phase="after", session_id=session_id, turn_no=turn_no,
+                       rss_bytes=snap_after["rss_bytes"], mem_available_bytes=snap_after["mem_available_bytes"])
+                logger.info(
+                    "Infinite Context index batch end session=%s turn=%d RSS=%.2f GiB MemAvailable=%.2f GiB",
+                    session_id, turn_no, _gib(snap_after["rss_bytes"]), _gib(snap_after["mem_available_bytes"]),
+                )
+                publish("running", "Indexing chat", turn_no, index_batch_turns, snap_after)
+
+        if completed:
+            with self._lock:
                 with self.conn:
-                    for tn, mi, ci, text in missing:
-                        chash = hashlib.sha256(_normalize_for_duplicate(text or "").encode("utf-8", "replace")).hexdigest()
-                        self.conn.execute("UPDATE chunks SET chunk_hash=?,source_chars=CASE WHEN source_chars=0 THEN ? ELSE source_chars END WHERE session_id=? AND turn_no=? AND message_index=? AND chunk_index=?",
-                                          (chash, len(text or ""), session_id, tn, mi, ci))
-            return {"changed_turns": len(changed), "expanded_spillover_files": expanded_files,
-                    "expanded_spillover_chars": expanded_chars}
+                    self.conn.execute("DELETE FROM turns WHERE session_id=? AND turn_no>?", (session_id, seen_turns))
+                    self.conn.execute("DELETE FROM chunks WHERE session_id=? AND turn_no>?", (session_id, seen_turns))
+            publish("complete", "Indexing complete", seen_turns, index_batch_turns)
+        return {
+            "changed_turns": changed_turns,
+            "expanded_spillover_files": expanded_files,
+            "expanded_spillover_chars": expanded_chars,
+            "processed_turns": seen_turns if completed else max(0, seen_turns - 1),
+            "complete": completed,
+            "state": "complete" if completed else pause_reason,
+            "index_batches": batch_count,
+        }
 
     def memory_last_processed_turn(self, session_id: str) -> int:
         with self._lock:
@@ -1331,9 +1551,29 @@ class SQLiteTurnStore:
         if not rows:
             return {"ok": True, "embedded": 0, "remaining": 0, "model": backend.model_name}
 
+        snap_before = _resource_snapshot()
+        avail = int(snap_before.get("mem_available_bytes") or 0)
+        pause_bytes = int(getattr(self, "memory_pause_bytes", 12 * 1024**3))
+        abort_bytes = int(getattr(self, "memory_abort_bytes", 8 * 1024**3))
+        _trace("embedding_batch_resource", phase="before_backfill", chunks=len(rows),
+               rss_bytes=snap_before["rss_bytes"], mem_available_bytes=avail)
+        logger.info("Infinite Context backfill batch start chunks=%d RSS=%.2f GiB MemAvailable=%.2f GiB",
+                    len(rows), _gib(snap_before["rss_bytes"]), _gib(avail))
+        if avail and avail < abort_bytes:
+            return {"ok": False, "embedded": 0, "aborted_low_memory": True, "error": f"MemAvailable {_gib(avail):.1f} GiB below abort threshold"}
+        if avail and avail < pause_bytes:
+            return {"ok": False, "embedded": 0, "paused_low_memory": True, "error": f"MemAvailable {_gib(avail):.1f} GiB below pause threshold"}
+
         # CPU-heavy embedding runs OUTSIDE the DB lock. /infinite status and
         # normal indexing can therefore continue while a backfill is active.
         vectors = backend.embed([str(r[4]) for r in rows])
+        snap_after = _resource_snapshot()
+        _trace("embedding_batch_resource", phase="after_backfill", chunks=len(rows),
+               rss_bytes=snap_after["rss_bytes"], mem_available_bytes=snap_after["mem_available_bytes"])
+        logger.info("Infinite Context backfill batch end chunks=%d RSS=%.2f GiB MemAvailable=%.2f GiB",
+                    len(rows), _gib(snap_after["rss_bytes"]), _gib(snap_after["mem_available_bytes"]))
+        if int(snap_after.get("mem_available_bytes") or 0) and int(snap_after["mem_available_bytes"]) < abort_bytes:
+            return {"ok": False, "embedded": 0, "aborted_low_memory": True, "error": f"MemAvailable {_gib(snap_after['mem_available_bytes']):.1f} GiB below abort threshold after embedding"}
         if len(vectors) != len(rows):
             return {"ok": False, "embedded": 0, "error": backend.error or "embedding count mismatch"}
 
@@ -1838,6 +2078,18 @@ class InfiniteContextV0(ContextEngine):
         self._embedding_job_lock = threading.RLock()
         self._embedding_thread: Optional[threading.Thread] = None
         self._embedding_batch_size = max(1, int(os.getenv("HERMES_INFINITE_EMBED_BATCH_SIZE", "32")))
+        self._index_batch_turns = max(1, int(os.getenv("HERMES_INFINITE_INDEX_BATCH_TURNS", "4")))
+        self._index_embed_batch_chunks = max(1, int(os.getenv("HERMES_INFINITE_INDEX_EMBED_BATCH_CHUNKS", "16")))
+        self._memory_pause_gib = max(1.0, float(os.getenv("HERMES_INFINITE_MEM_PAUSE_GIB", "12")))
+        self._memory_abort_gib = max(1.0, float(os.getenv("HERMES_INFINITE_MEM_ABORT_GIB", "8")))
+        if self._memory_abort_gib >= self._memory_pause_gib:
+            self._memory_abort_gib = max(1.0, self._memory_pause_gib - 1.0)
+        self._memory_pause_bytes = int(self._memory_pause_gib * 1024**3)
+        self._memory_abort_bytes = int(self._memory_abort_gib * 1024**3)
+        self.store.index_batch_turns = self._index_batch_turns
+        self.store.embed_batch_chunks = self._index_embed_batch_chunks
+        self.store.memory_pause_bytes = self._memory_pause_bytes
+        self.store.memory_abort_bytes = self._memory_abort_bytes
         self._embedding_job: Dict[str, Any] = {
             "state": "idle", "scope": "", "session_id": "",
             "done": 0, "total": 0, "remaining": 0, "error": "",
@@ -1882,7 +2134,7 @@ class InfiniteContextV0(ContextEngine):
         self.store.chunk_chars = self.chunk_chars
         self.store.chunk_overlap_chars = self.chunk_overlap_chars
 
-        # Infinite Memory v0.9.0: background curation, scoped retrieval, project namespaces, plus salience/forgetting. Normal turns
+        # Infinite Memory v0.9.1: background curation, scoped retrieval, project namespaces, plus salience/forgetting. Normal turns
         # never wait for memory housekeeping. New user activity cancels an
         # in-flight background curation request and resets the idle timer.
         self.memory_enabled = os.getenv("HERMES_INFINITE_MEMORY_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
@@ -2228,6 +2480,18 @@ class InfiniteContextV0(ContextEngine):
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def _process_memory_once(self, session_id: str, reason: str) -> Dict[str, Any]:
+        snap = _resource_snapshot()
+        avail = int(snap.get("mem_available_bytes") or 0)
+        if avail and avail < self._memory_abort_bytes:
+            self._set_memory_job(state="aborted_low_memory", session_id=session_id, error=f"MemAvailable {_gib(avail):.1f} GiB")
+            _write_operation_status(self.store.hermes_home, operation="memory_upkeep", state="aborted_low_memory",
+                                    detail=f"Memory upkeep aborted: MemAvailable {_gib(avail):.1f} GiB", session_id=session_id, resource=snap)
+            return {"ok": False, "memory_pressure": True, "aborted_low_memory": True}
+        if avail and avail < self._memory_pause_bytes:
+            self._set_memory_job(state="paused_low_memory", session_id=session_id, error=f"MemAvailable {_gib(avail):.1f} GiB")
+            _write_operation_status(self.store.hermes_home, operation="memory_upkeep", state="paused_low_memory",
+                                    detail=f"Memory upkeep paused: MemAvailable {_gib(avail):.1f} GiB", session_id=session_id, resource=snap)
+            return {"ok": False, "memory_pressure": True, "paused_low_memory": True}
         last = self.store.memory_last_processed_turn(session_id)
         batch, last_in_batch = self.store.memory_source_turns(
             session_id,
@@ -2250,7 +2514,17 @@ class InfiniteContextV0(ContextEngine):
         if not self._backend_appears_idle() and reason != "manual":
             self._set_memory_job(state="waiting_backend", error="backend busy")
             return {"ok": False, "busy": True, "error": "backend busy"}
+        _write_operation_status(self.store.hermes_home, operation="memory_upkeep", state="running",
+                                detail=f"Curating {len(batch)} turns", session_id=session_id,
+                                batch_size=len(batch), resource=snap)
         result = self._curate_memory_batch(batch)
+        after_curate = _resource_snapshot()
+        if int(after_curate.get("mem_available_bytes") or 0) and int(after_curate["mem_available_bytes"]) < self._memory_abort_bytes:
+            self._set_memory_job(state="aborted_low_memory", error=f"MemAvailable {_gib(after_curate['mem_available_bytes']):.1f} GiB", finished_at=time.time())
+            _write_operation_status(self.store.hermes_home, operation="memory_upkeep", state="aborted_low_memory",
+                                    detail=f"Memory upkeep aborted after model call: MemAvailable {_gib(after_curate['mem_available_bytes']):.1f} GiB",
+                                    session_id=session_id, resource=after_curate)
+            return {"ok": False, "memory_pressure": True, "aborted_low_memory": True}
         if not result.get("ok"):
             state = "cancelled" if result.get("cancelled") else "error"
             self._set_memory_job(state=state, error=result.get("error", "unknown error"), finished_at=time.time())
@@ -2275,6 +2549,9 @@ class InfiniteContextV0(ContextEngine):
         )
         _trace("memory_curated", session_id=session_id, reason=reason,
                through_turn=last_in_batch, saved=saved, remaining=remaining)
+        _write_operation_status(self.store.hermes_home, operation="memory_upkeep", state="complete",
+                                detail=f"Memory upkeep complete; {remaining} turns remain", session_id=session_id,
+                                done=last_in_batch, resource=_resource_snapshot())
         return {"ok": True, "saved": saved, "remaining": remaining, "through_turn": last_in_batch}
 
     def _memory_worker_loop(self) -> None:
@@ -2298,6 +2575,12 @@ class InfiniteContextV0(ContextEngine):
                 self._set_memory_job(state="idle", session_id=sid, pending_turns=0, last_processed_turn=last)
                 continue
             result = self._process_memory_once(sid, "idle")
+            if result.get("memory_pressure"):
+                # Stay dormant while RAM is constrained; retry periodically without
+                # treating memory pressure as user activity.
+                self._memory_wakeup.wait(timeout=10.0)
+                self._memory_wakeup.set()
+                continue
             if result.get("busy") or result.get("cancelled"):
                 self._last_activity = time.monotonic()
                 continue
@@ -2488,9 +2771,8 @@ class InfiniteContextV0(ContextEngine):
         self._memory_cancel.set()
         self._memory_wakeup.set()
         try:
-            _, turns = _segment_turns(messages)
-            if session_id and turns:
-                self.store.upsert_turns(str(session_id), turns)
+            if session_id:
+                self.store.upsert_turns(str(session_id), _iter_segmented_turns(messages))
         finally:
             if self._memory_thread is not None and self._memory_thread.is_alive():
                 self._memory_thread.join(timeout=2.0)
@@ -2507,11 +2789,11 @@ class InfiniteContextV0(ContextEngine):
     def on_turn_complete(self, messages: List[Dict[str, Any]], usage: Dict[str, Any] = None, **kwargs: Any) -> None:
         self._turn_inflight = False
         self._mark_activity()
-        session_id=str(kwargs.get("session_id") or self.session_id or ""); _,turns=_segment_turns(messages)
+        session_id=str(kwargs.get("session_id") or self.session_id or "")
         _trace("on_turn_complete",pid=os.getpid(),self_session_id=self.session_id,resolved_session_id=session_id,
-               message_count=len(messages),turn_count=len(turns),usage=usage,meta=kwargs)
+               message_count=len(messages),usage=usage,meta=kwargs)
         if not session_id: return
-        sync=self.store.upsert_turns(session_id,turns) if turns else {}
+        sync=self.store.upsert_turns(session_id, _iter_segmented_turns(messages))
         try:
             _sid,status=self.store.load_runtime_status(session_id); status=status or dict(self.last_selection or {})
             provider_prompt=int((usage or {}).get("prompt_tokens") or (usage or {}).get("input_tokens") or 0)
@@ -2552,7 +2834,7 @@ class InfiniteContextV0(ContextEngine):
         if not request_messages:
             return None
 
-        # v0.9.0: slash commands cannot safely identify their originating chat.
+        # v0.9.1: slash commands cannot safely identify their originating chat.
         # Consume queued project changes only here, on a real provider request,
         # where self.session_id has been resolved for this request. This happens
         # before durable-memory retrieval so same-request project recall works.
@@ -2566,10 +2848,10 @@ class InfiniteContextV0(ContextEngine):
         # including mid-turn tool loops.
         sync_result: Dict[str, Any] = {}
         if self.session_id and conversation_messages:
-            _, persisted_turns = _segment_turns(conversation_messages)
-            if persisted_turns:
-                try: sync_result = self.store.upsert_turns(self.session_id, persisted_turns)
-                except Exception as exc: _trace("pre_request_sync_error",session_id=self.session_id,error_type=type(exc).__name__,error=str(exc))
+            try:
+                sync_result = self.store.upsert_turns(self.session_id, _iter_segmented_turns(conversation_messages))
+            except Exception as exc:
+                _trace("pre_request_sync_error",session_id=self.session_id,error_type=type(exc).__name__,error=str(exc))
 
         # Current query drives both durable-memory and cold-transcript retrieval.
         # Prefer the host-supplied incoming message because request_messages may
@@ -2580,7 +2862,7 @@ class InfiniteContextV0(ContextEngine):
         if not query:
             query = _text_content(turns[-1][0].get("content"))
 
-        # v0.9.0: a new, unbound chat may explicitly refer to work from another
+        # v0.9.1: a new, unbound chat may explicitly refer to work from another
         # chat. Resolve that against known project metadata before memory retrieval.
         # The inference is deliberately conservative: continuity language plus
         # project-label evidence is required, and semantic similarity alone can
@@ -2910,9 +3192,32 @@ class InfiniteContextV0(ContextEngine):
                 self._embedding_job.update(total=total, remaining=total, done=0)
             done = 0
             while True:
+                snap = _resource_snapshot()
+                avail = int(snap.get("mem_available_bytes") or 0)
+                if avail and avail < self._memory_pause_bytes:
+                    state = "aborted_low_memory" if avail < self._memory_abort_bytes else "paused_low_memory"
+                    detail = f"Embedding paused: MemAvailable {_gib(avail):.1f} GiB"
+                    with self._embedding_job_lock:
+                        self._embedding_job.update(state=state, error=detail)
+                    _write_operation_status(self.store.hermes_home, operation="embedding", state=state,
+                                            detail=detail, session_id=session_id, done=done, total=total,
+                                            batch_size=self._embedding_batch_size, resource=snap)
+                    time.sleep(5.0)
+                    continue
+                with self._embedding_job_lock:
+                    self._embedding_job.update(state="running", error="")
+                _write_operation_status(self.store.hermes_home, operation="embedding", state="running",
+                                        detail=f"Embedding up to {self._embedding_batch_size} chunks",
+                                        session_id=session_id, done=done, total=total,
+                                        batch_size=self._embedding_batch_size, resource=snap)
                 result = self.store.backfill_embeddings(
                     session_id=session_id, limit=self._embedding_batch_size
                 )
+                if result.get("paused_low_memory") or result.get("aborted_low_memory"):
+                    # The store re-checks immediately before/after inference. Retry
+                    # only after pressure subsides; no partial vector batch is written.
+                    time.sleep(5.0)
+                    continue
                 if not result.get("ok"):
                     raise RuntimeError(str(result.get("error") or "embedding backfill failed"))
                 embedded = int(result.get("embedded") or 0)
@@ -2926,6 +3231,9 @@ class InfiniteContextV0(ContextEngine):
                 self._embedding_job.update(
                     state="complete", done=done, remaining=0, error="", finished_at=time.time()
                 )
+            _write_operation_status(self.store.hermes_home, operation="embedding", state="complete",
+                                    detail="Embedding complete", session_id=session_id, done=done, total=total,
+                                    batch_size=self._embedding_batch_size, resource=_resource_snapshot())
             logger.info(
                 "Infinite Context embedding backfill complete: scope=%s embedded=%d", scope, done
             )
@@ -2933,6 +3241,8 @@ class InfiniteContextV0(ContextEngine):
             err = f"{type(exc).__name__}: {exc}"
             with self._embedding_job_lock:
                 self._embedding_job.update(state="failed", error=err, finished_at=time.time())
+            _write_operation_status(self.store.hermes_home, operation="embedding", state="failed",
+                                    detail=err, session_id=session_id, resource=_resource_snapshot())
             logger.warning("Infinite Context embedding backfill failed: %s", err, exc_info=True)
 
     def format_status(self, session_prefix: str = "") -> str:
@@ -2967,7 +3277,7 @@ class InfiniteContextV0(ContextEngine):
 
         sel = persisted_sel or self.last_selection or {}
         lines = [
-            "Infinite Context v0.9.0",
+            "Infinite Context v0.9.1",
             f"  Active engine: {'YES' if (_ACTIVE_ENGINE is self and self._configured_engine_name() == 'infinite_v0') else 'NO/UNKNOWN'}",
             f"  Configured engine: {self._configured_engine_name() or '(unknown)'}",
             f"  Session: {status_session or '(none)'}",
@@ -2981,7 +3291,18 @@ class InfiniteContextV0(ContextEngine):
             f"  Semantic backend: {'ready' if self.embedding_backend.available else 'lexical fallback'}",
             f"  Embedding model: {self.embedding_backend.model_name}",
             f"  Embedding error: {self.embedding_backend.error or '(none)'}",
+            f"  RAM guard: pause below {self._memory_pause_gib:.1f} GiB; abort batch below {self._memory_abort_gib:.1f} GiB",
+            f"  Index batch: {self._index_batch_turns} turns; inline embed batch: {self._index_embed_batch_chunks} chunks",
         ]
+        resource = _resource_snapshot()
+        lines.append(f"  Process RSS: {_gib(resource.get('rss_bytes', 0)):.2f} GiB; MemAvailable: {_gib(resource.get('mem_available_bytes', 0)):.2f} GiB")
+        try:
+            op_path = self.store.hermes_home / "context_engine" / "infinite_v0_status.json"
+            if op_path.is_file():
+                op = json.loads(op_path.read_text(encoding="utf-8"))
+                lines.append(f"  Current operation: {op.get('state','?')} — {op.get('detail') or op.get('operation') or '(none)'}")
+        except Exception:
+            pass
         job = self._embedding_job_snapshot()
         if job.get("state") != "idle":
             lines.append(

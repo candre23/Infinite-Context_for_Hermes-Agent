@@ -88,6 +88,10 @@ Restart Hermes after installation and verify with:
 /infinite status
 ```
 
+## Updating
+
+Unless stated otherwise, new versions can simply be installed over the old version with the included script.
+
 
 ## Commands
 
